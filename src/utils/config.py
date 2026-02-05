@@ -99,6 +99,7 @@ model_names = {
         "Qwen/Qwen3-235B-A22B",
     ],
     "zkh": [
+        "ep_20250815_yc11",   #通义千问vl max# 
         "ep_20251217_i18v",   #deepseek-v3-百炼
         "ep_20250908_1pgk",   #DeepSeek-V3.1-百炼
         "ep_20251217_hr5x",   #deepseek-r1-百炼

@@ -114,6 +114,115 @@ class DeepSeekR1ChatOpenAI(ChatOpenAI):
         return AIMessage(content=content, reasoning_content=reasoning_content)
 
 
+class ZKHChatOpenAI(ChatOpenAI):
+    """
+    震坤行(ZKH) AI API 的自定义ChatOpenAI包装类
+    处理ZKH特定的API请求格式和认证
+    完整支持 Tool Calling (Function Calling)
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # 使用自定义的OpenAI客户端处理ZKH API
+        self.client = OpenAI(
+            base_url=kwargs.get("base_url"),
+            api_key=kwargs.get("api_key"),
+            default_headers={
+                "Authorization": f"Bearer {kwargs.get('api_key')}",
+                "Content-Type": "application/json"
+            }
+        )
+
+    async def ainvoke(
+            self,
+            input: LanguageModelInput,
+            config: Optional[RunnableConfig] = None,
+            *,
+            stop: Optional[list[str]] = None,
+            **kwargs: Any,
+    ) -> AIMessage:
+        message_history = []
+        for input_ in input:
+            if isinstance(input_, SystemMessage):
+                message_history.append({"role": "system", "content": input_.content})
+            elif isinstance(input_, AIMessage):
+                msg = {"role": "assistant", "content": input_.content}
+                # ✅ 处理 tool_calls
+                if hasattr(input_, "tool_calls") and input_.tool_calls:
+                    msg["tool_calls"] = input_.tool_calls
+                message_history.append(msg)
+            else:
+                message_history.append({"role": "user", "content": input_.content})
+
+        # ✅ 构建 API 调用参数
+        api_kwargs = {
+            "model": self.model_name,
+            "messages": message_history,
+            "temperature": self.temperature,
+        }
+        
+        # ✅ 从 kwargs 中提取并传递 tools 参数（关键修复！）
+        if "tools" in kwargs and kwargs["tools"]:
+            api_kwargs["tools"] = kwargs["tools"]
+        
+        response = self.client.chat.completions.create(**api_kwargs)
+
+        content = response.choices[0].message.content
+        # ✅ 提取 tool_calls
+        tool_calls = getattr(response.choices[0].message, "tool_calls", None)
+        
+        ai_message = AIMessage(content=content)
+        if tool_calls:
+            ai_message.tool_calls = tool_calls
+        return ai_message
+
+    def invoke(
+            self,
+            input: LanguageModelInput,
+            config: Optional[RunnableConfig] = None,
+            *,
+            stop: Optional[list[str]] = None,
+            **kwargs: Any,
+    ) -> AIMessage:
+        message_history = []
+        for input_ in input:
+            if isinstance(input_, SystemMessage):
+                message_history.append({"role": "system", "content": input_.content})
+            elif isinstance(input_, AIMessage):
+                msg = {"role": "assistant", "content": input_.content}
+                # ✅ 处理 tool_calls
+                if hasattr(input_, "tool_calls") and input_.tool_calls:
+                    msg["tool_calls"] = input_.tool_calls
+                message_history.append(msg)
+            else:
+                message_history.append({"role": "user", "content": input_.content})
+
+        # ✅ 构建 API 调用参数
+        api_kwargs = {
+            "model": self.model_name,
+            "messages": message_history,
+            "temperature": self.temperature,
+        }
+        
+        # ✅ 从 kwargs 中提取并传递 tools 参数（关键修复！）
+        if "tools" in kwargs and kwargs["tools"]:
+            api_kwargs["tools"] = kwargs["tools"]
+        
+        response = self.client.chat.completions.create(**api_kwargs)
+
+        content = response.choices[0].message.content
+        # ✅ 提取 tool_calls
+        tool_calls = getattr(response.choices[0].message, "tool_calls", None)
+        
+        ai_message = AIMessage(content=content)
+        if tool_calls:
+            ai_message.tool_calls = tool_calls
+        return ai_message
+
+        content = response.choices[0].message.content
+        return AIMessage(content=content)
+
+
 class DeepSeekR1ChatOllama(ChatOllama):
 
     async def ainvoke(
@@ -361,16 +470,15 @@ def get_llm_model(provider: str, **kwargs):
                 "💥 震坤行API Key未找到！🔑 请设置 `ZKH_API_KEY` 环境变量或在UI中提供。"
             )
         if not kwargs.get("base_url", ""):
-            # ChatOpenAI 会在 base_url 后面自动拼接 /chat/completions，
-            # 所以这里需要包含 /v1 路径
             base_url = os.getenv("ZKH_ENDPOINT", "https://ai-dev-gateway.zkh360.com/llm")
-            # 确保 base_url 包含 /v1 路径
-            if not base_url.endswith("/v1"):
-                base_url = base_url.rstrip("/") + "/v1"
         else:
             base_url = kwargs.get("base_url")
         
-        return ChatOpenAI(
+        # 确保 base_url 包含 /v1 路径，ZKHChatOpenAI 会自动处理路由
+        if not base_url.endswith("/v1"):
+            base_url = base_url.rstrip("/") + "/v1"
+        
+        return ZKHChatOpenAI(
             model=kwargs.get("model_name", "ep_20251217_i18v"),
             temperature=kwargs.get("temperature", 0.0),
             base_url=base_url,

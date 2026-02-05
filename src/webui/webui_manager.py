@@ -40,6 +40,11 @@ class WebuiManager:
         self.bu_user_help_response: Optional[str] = None
         self.bu_current_task: Optional[asyncio.Task] = None
         self.bu_agent_task_id: Optional[str] = None
+        
+        # 添加步数和失败计数追踪
+        self.bu_current_step: int = 0
+        self.bu_max_steps: int = 30
+        self.bu_failure_count: int = 0
 
     def init_deep_research_agent(self) -> None:
         """
