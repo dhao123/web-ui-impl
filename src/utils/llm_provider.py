@@ -141,6 +141,7 @@ class ZKHChatOpenAI(ChatOpenAI):
             stop: Optional[list[str]] = None,
             **kwargs: Any,
     ) -> AIMessage:
+        import traceback
         message_history = []
         for input_ in input:
             if isinstance(input_, SystemMessage):
@@ -160,17 +161,24 @@ class ZKHChatOpenAI(ChatOpenAI):
             "messages": message_history,
             "temperature": self.temperature,
         }
-        
         # ✅ 从 kwargs 中提取并传递 tools 参数（关键修复！）
         if "tools" in kwargs and kwargs["tools"]:
             api_kwargs["tools"] = kwargs["tools"]
-        
-        response = self.client.chat.completions.create(**api_kwargs)
 
+        # 日志输出请求参数
+        print("\n[ZKHChatOpenAI] 请求参数:", api_kwargs)
+        try:
+            response = self.client.chat.completions.create(**api_kwargs)
+        except Exception as e:
+            print("[ZKHChatOpenAI] LLM请求异常:", str(e))
+            print("[ZKHChatOpenAI] Traceback:\n", traceback.format_exc())
+            raise
+
+        print("[ZKHChatOpenAI] 响应:", response)
         content = response.choices[0].message.content
         # ✅ 提取 tool_calls
         tool_calls = getattr(response.choices[0].message, "tool_calls", None)
-        
+
         ai_message = AIMessage(content=content)
         if tool_calls:
             ai_message.tool_calls = tool_calls
@@ -470,14 +478,10 @@ def get_llm_model(provider: str, **kwargs):
                 "💥 震坤行API Key未找到！🔑 请设置 `ZKH_API_KEY` 环境变量或在UI中提供。"
             )
         if not kwargs.get("base_url", ""):
-            base_url = os.getenv("ZKH_ENDPOINT", "https://ai-dev-gateway.zkh360.com/llm")
+            base_url = os.getenv("ZKH_ENDPOINT", "https://ai-dev-gateway.zkh360.com/llm/v1")
         else:
             base_url = kwargs.get("base_url")
-        
-        # 确保 base_url 包含 /v1 路径，ZKHChatOpenAI 会自动处理路由
-        if not base_url.endswith("/v1"):
-            base_url = base_url.rstrip("/") + "/v1"
-        
+        # 不再强制补 /v1，直接用配置
         return ZKHChatOpenAI(
             model=kwargs.get("model_name", "ep_20251217_i18v"),
             temperature=kwargs.get("temperature", 0.0),

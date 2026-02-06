@@ -29,6 +29,50 @@ logger = logging.getLogger(__name__)
 
 # --- Helper Functions --- (Defined at module level)
 
+def _diagnose_tool_calling_config(
+        llm_provider_name: Optional[str],
+        model_name: Optional[str],
+        tool_calling_method: Optional[str],
+) -> str:
+    """
+    诊断Tool Calling配置是否合理，返回诊断信息。
+    """
+    diagnosis = []
+    
+    if not llm_provider_name or not model_name:
+        diagnosis.append("⚠️ LLM提供商或模型名称未指定")
+        return "\n".join(diagnosis)
+    
+    diagnosis.append(f"🔧 Tool Calling 配置诊断:")
+    diagnosis.append(f"   LLM提供商: {llm_provider_name}")
+    diagnosis.append(f"   模型: {model_name}")
+    diagnosis.append(f"   Tool Calling Method: {tool_calling_method or 'auto'}")
+    
+    # 根据不同的模型给出建议
+    if "gpt" in model_name.lower() or "claude" in model_name.lower():
+        diagnosis.append(f"   ✅ 支持工具调用的模型")
+        if tool_calling_method == "auto" or tool_calling_method == "function_calling":
+            diagnosis.append(f"   ✅ 推荐使用 'function_calling' 或 'auto'")
+        elif tool_calling_method == "raw":
+            diagnosis.append(f"   ⚠️ 'raw'模式可能导致action为空，建议改为'function_calling'")
+    
+    elif "qwen" in model_name.lower() or "deepseek" in model_name.lower():
+        diagnosis.append(f"   ✅ 支持工具调用的模型")
+        if tool_calling_method == "json_mode":
+            diagnosis.append(f"   ✅ 'json_mode' 是兼容的选择")
+        elif tool_calling_method == "raw":
+            diagnosis.append(f"   ⚠️ 'raw'模式可能导致action为空")
+    
+    elif "zkh" in llm_provider_name.lower():
+        # ✅ 添加对 ZKH 的诊断信息
+        diagnosis.append(f"   ✅ 支持工具调用的模型（已完整实现 Tool Calling）")
+        if tool_calling_method == "function_calling" or tool_calling_method == "auto":
+            diagnosis.append(f"   ✅ 已自动配置为 'function_calling' 模式")
+        else:
+            diagnosis.append(f"   ⚠️ 建议使用 'function_calling' 模式以获得最佳兼容性")
+    
+    return "\n".join(diagnosis)
+
 
 async def _initialize_llm(
         provider: Optional[str],
@@ -96,20 +140,52 @@ def _get_config_value(
 
 
 def _format_agent_output(model_output: AgentOutput) -> str:
-    """Formats AgentOutput for display in the chatbot using JSON."""
+    """Formats AgentOutput for display in the chatbot using JSON.
+    
+    Handles edge cases like empty actions or incomplete action objects.
+    """
     content = ""
     if model_output:
         try:
             # Directly use model_dump if actions and current_state are Pydantic models
-            action_dump = [
-                action.model_dump(exclude_none=True) for action in model_output.action
-            ]
+            action_dump = []
+            
+            # 诊断：检查action是否为空或无效
+            if model_output.action:
+                for idx, action in enumerate(model_output.action):
+                    action_dict = action.model_dump(exclude_none=True)
+                    
+                    # 诊断日志：检测空action
+                    if not action_dict:
+                        logger.warning(
+                            f"⚠️ 检测到空Action对象在索引{idx}: "
+                            f"原始对象类型={type(action).__name__}, "
+                            f"原始对象={action}"
+                        )
+                        # 尝试获取action的所有字段，包括None值，用于诊断
+                        try:
+                            all_fields = action.model_dump(exclude_none=False)
+                            logger.warning(f"   Action完整字段（包括None）: {all_fields}")
+                        except Exception as e:
+                            logger.warning(f"   无法获取完整字段: {e}")
+                    
+                    action_dump.append(action_dict)
+            else:
+                logger.warning("⚠️ model_output.action为空或None")
 
             state_dump = model_output.current_state.model_dump(exclude_none=True)
             model_output_dump = {
                 "current_state": state_dump,
                 "action": action_dump,
             }
+            
+            # 额外的诊断：检查是否action为空但current_state有内容
+            if not action_dump and state_dump:
+                logger.warning(
+                    f"⚠️ 检测到Action为空但State有内容 - 可能的LLM问题\n"
+                    f"   State: {json.dumps(state_dump, indent=2, ensure_ascii=False)[:300]}..."
+                )
+            
             # Dump to JSON string with indentation
             json_string = json.dumps(model_output_dump, indent=4, ensure_ascii=False)
             # Wrap in <pre><code> for proper display in HTML
@@ -117,11 +193,11 @@ def _format_agent_output(model_output: AgentOutput) -> str:
 
         except AttributeError as ae:
             logger.error(
-                f"AttributeError during model dump: {ae}. Check if 'action' or 'current_state' or their items support 'model_dump'."
+                f"❌ AttributeError during model dump: {ae}. Check if 'action' or 'current_state' or their items support 'model_dump'."
             )
             content = f"<pre><code>Error: Could not format agent output (AttributeError: {ae}).\nRaw output: {str(model_output)}</code></pre>"
         except Exception as e:
-            logger.error(f"Error formatting agent output: {e}", exc_info=True)
+            logger.error(f"❌ Error formatting agent output: {e}", exc_info=True)
             # Fallback to simple string representation on error
             content = f"<pre><code>Error formatting agent output.\nRaw output:\n{str(model_output)}</code></pre>"
 
@@ -298,6 +374,12 @@ async def run_agent_task(
     browser_view_comp = webui_manager.get_component_by_id(
         "browser_use_agent.browser_view"
     )
+    
+    # 新增：步数和失败计数组件
+    step_progress_comp = webui_manager.get_component_by_id("browser_use_agent.step_progress")
+    max_steps_display_comp = webui_manager.get_component_by_id("browser_use_agent.max_steps_display")
+    failure_counter_comp = webui_manager.get_component_by_id("browser_use_agent.failure_counter")
+    step_status_comp = webui_manager.get_component_by_id("browser_use_agent.step_status")
 
     # --- 1. Get Task and Initial UI Update ---
     task = components.get(user_input_comp, "").strip()
@@ -308,19 +390,10 @@ async def run_agent_task(
 
     # Set running state indirectly via _current_task
     webui_manager.bu_chat_history.append({"role": "user", "content": task})
-
-    yield {
-        user_input_comp: gr.Textbox(
-            value="", interactive=False, placeholder="Agent is running..."
-        ),
-        run_button_comp: gr.Button(value="⏳ Running...", interactive=False),
-        stop_button_comp: gr.Button(interactive=True),
-        pause_resume_button_comp: gr.Button(value="⏸️ Pause", interactive=True),
-        clear_button_comp: gr.Button(interactive=False),
-        chatbot_comp: gr.update(value=webui_manager.bu_chat_history),
-        history_file_comp: gr.update(value=None),
-        gif_comp: gr.update(value=None),
-    }
+    
+    # 初始化步数追踪
+    webui_manager.bu_current_step = 0
+    webui_manager.bu_failure_count = 0
 
     # --- Agent Settings ---
     # Access settings values via components dict, getting IDs from webui_manager
@@ -339,11 +412,17 @@ async def run_agent_task(
     ollama_num_ctx = get_setting("ollama_num_ctx", 16000)
     llm_base_url = get_setting("llm_base_url") or None
     llm_api_key = get_setting("llm_api_key") or None
-    max_steps = get_setting("max_steps", 100)
+    max_steps = get_setting("max_steps", 30)
     max_actions = get_setting("max_actions", 10)
     max_input_tokens = get_setting("max_input_tokens", 128000)
     tool_calling_str = get_setting("tool_calling_method", "auto")
     tool_calling_method = tool_calling_str if tool_calling_str != "None" else None
+    
+    # ✅ 对于 zkh 提供商，强制使用 function_calling 以支持工具调用
+    if llm_provider_name == "zkh" and tool_calling_method == "auto":
+        tool_calling_method = "function_calling"
+        logger.info("🔧 ZKH 提供商已自动设置 Tool Calling Method 为 'function_calling' 以支持工具调用")
+    
     mcp_server_config_comp = webui_manager.id_to_component.get(
         "agent_settings.mcp_server_config"
     )
@@ -401,6 +480,24 @@ async def run_agent_task(
 
     stream_vw = 70
     stream_vh = int(70 * window_h // window_w)
+
+    # 更新UI显示初始状态
+    yield {
+        user_input_comp: gr.Textbox(
+            value="", interactive=False, placeholder="Agent is running..."
+        ),
+        run_button_comp: gr.Button(value="⏳ Running...", interactive=False),
+        stop_button_comp: gr.Button(interactive=True),
+        pause_resume_button_comp: gr.Button(value="⏸️ Pause", interactive=True),
+        clear_button_comp: gr.Button(interactive=False),
+        chatbot_comp: gr.update(value=webui_manager.bu_chat_history),
+        history_file_comp: gr.update(value=None),
+        gif_comp: gr.update(value=None),
+        step_progress_comp: gr.update(value=0),
+        max_steps_display_comp: gr.update(value=max_steps),
+        failure_counter_comp: gr.update(value=0),
+        step_status_comp: gr.update(value="启动中..."),
+    }
 
     os.makedirs(save_agent_history_path, exist_ok=True)
     if save_recording_path:
@@ -526,9 +623,17 @@ async def run_agent_task(
                 raise ValueError(
                     "Browser or Context not initialized, cannot create agent."
                 )
+            
+            # 诊断Tool Calling配置
+            config_diagnosis = _diagnose_tool_calling_config(
+                llm_provider_name, llm_model_name, tool_calling_method
+            )
+            logger.info(f"\n{config_diagnosis}")
+            
             webui_manager.bu_agent = BrowserUseAgent(
                 task=task,
                 llm=main_llm,
+                extraction_llm=main_llm,  # 显式指定 extraction_llm，彻底避免 fallback
                 browser=webui_manager.bu_browser,
                 browser_context=webui_manager.bu_browser_context,
                 controller=webui_manager.bu_controller,
@@ -655,6 +760,25 @@ async def run_agent_task(
                     value=webui_manager.bu_chat_history
                 )
                 last_chat_len = len(webui_manager.bu_chat_history)
+            
+            # 更新步数进度信息
+            if webui_manager.bu_agent and webui_manager.bu_agent.state.history:
+                current_step = len(webui_manager.bu_agent.state.history.history)
+                failure_count = sum(
+                    1 for item in webui_manager.bu_agent.state.history.history
+                    if item.result and item.result[0].error
+                )
+                
+                if current_step != webui_manager.bu_current_step or failure_count != webui_manager.bu_failure_count:
+                    webui_manager.bu_current_step = current_step
+                    webui_manager.bu_failure_count = failure_count
+                    
+                    step_status = "执行中..." if current_step < max_steps else "完成"
+                    
+                    update_dict[step_progress_comp] = gr.update(value=current_step)
+                    update_dict[failure_counter_comp] = gr.update(value=failure_count)
+                    update_dict[step_status_comp] = gr.update(value=step_status)
+                    logger.info(f"📊 进度: 步骤 {current_step}/{max_steps}, 失败次数: {failure_count}")
 
             # Update Browser View
             if headless and webui_manager.bu_browser_context:
@@ -765,6 +889,8 @@ async def run_agent_task(
                         value="⏸️ Pause", interactive=False
                     ),
                     clear_button_comp: gr.update(interactive=True),
+                    # 更新最终步数状态
+                    step_status_comp: gr.update(value="已完成"),
                     # Ensure final chat history is shown
                     chatbot_comp: gr.update(value=webui_manager.bu_chat_history),
                 }
@@ -978,6 +1104,33 @@ def create_browser_use_agent_tab(webui_manager: WebuiManager):
     # --- Define UI Components ---
     tab_components = {}
     with gr.Column():
+        # 进度监控组件
+        with gr.Group():
+            with gr.Row():
+                step_progress = gr.Number(
+                    label="当前步数",
+                    value=0,
+                    interactive=False,
+                    scale=1
+                )
+                max_steps_display = gr.Number(
+                    label="最大步数",
+                    value=30,
+                    interactive=False,
+                    scale=1
+                )
+                failure_counter = gr.Number(
+                    label="失败次数",
+                    value=0,
+                    interactive=False,
+                    scale=1
+                )
+                step_status = gr.Label(
+                    label="步骤状态",
+                    value="等待中...",
+                    visible=True
+                )
+        
         chatbot = gr.Chatbot(
             lambda: webui_manager.bu_chat_history,  # Load history dynamically
             elem_id="browser_use_chatbot",
@@ -1033,6 +1186,10 @@ def create_browser_use_agent_tab(webui_manager: WebuiManager):
             agent_history_file=agent_history_file,
             recording_gif=recording_gif,
             browser_view=browser_view,
+            step_progress=step_progress,
+            max_steps_display=max_steps_display,
+            failure_counter=failure_counter,
+            step_status=step_status,
         )
     )
     webui_manager.add_components(

@@ -68,6 +68,8 @@ class RetryStrategy:
 
 class BrowserUseAgent(Agent):
     def __init__(self, *args, **kwargs):
+        # 兼容 webui 传递 extraction_llm 参数
+        self.extraction_llm = kwargs.pop('extraction_llm', None)
         super().__init__(*args, **kwargs)
         # 初始化重试策略
         self.retry_strategy = RetryStrategy()
