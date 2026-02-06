@@ -88,6 +88,10 @@ class BrowserUseAgent(Agent):
                 return 'function_calling'
             elif self.chat_model_library == 'ZKHChatOpenAI':
                 # ✅ 添加对 ZKHChatOpenAI 的支持
+                # ZKH (震坤行) 模型完整支持 function_calling
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(f'🔧 ZKH 提供商已自动设置 Tool Calling Method 为 \'function_calling\' 以支持工具调用')
                 return 'function_calling'
             else:
                 return None
@@ -188,6 +192,46 @@ class BrowserUseAgent(Agent):
                 return False
         
         return True
+    
+    def _diagnose_llm_failure(self, step_num: int, error: Exception) -> str:
+        """
+        诊断LLM API调用失败的原因
+        返回诊断信息字符串
+        """
+        import traceback
+        error_msg = str(error)
+        error_type = type(error).__name__
+        
+        diagnosis = f"\n🔍 步骤 {step_num + 1} LLM调用诊断:\n"
+        diagnosis += f"   错误类型: {error_type}\n"
+        diagnosis += f"   错误信息: {error_msg}\n"
+        
+        # 根据错误类型给出诊断建议
+        if "400" in error_msg:
+            diagnosis += f"   ❌ HTTP 400 Bad Request - 请求参数格式错误\n"
+            diagnosis += f"   🔧 可能原因:\n"
+            diagnosis += f"      1. tools参数格式不兼容\n"
+            diagnosis += f"      2. 消息内容过长或包含不支持的字符\n"
+            diagnosis += f"      3. API认证信息不正确\n"
+            diagnosis += f"      4. ZKH API版本不匹配\n"
+            diagnosis += f"   💡 建议: 检查ZKH_API_KEY、ZKH_ENDPOINT配置，或尝试减少系统提示词长度\n"
+        elif "401" in error_msg or "unauthorized" in error_msg.lower():
+            diagnosis += f"   ❌ 认证失败 - API密钥或授权信息无效\n"
+            diagnosis += f"   💡 建议: 检查ZKH_API_KEY环境变量是否正确设置\n"
+        elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+            diagnosis += f"   ⏱️ 连接超时或网络错误\n"
+            diagnosis += f"   💡 建议: 检查网络连接，稍后重试\n"
+        elif "tool" in error_msg.lower():
+            diagnosis += f"   ❌ Tool Calling 相关错误\n"
+            diagnosis += f"   💡 建议: 检查Tool Calling Method设置，尝试改为'json_mode'或'raw'\n"
+        
+        # 记录完整traceback用于调试
+        diagnosis += f"\n   完整Traceback:\n"
+        for line in traceback.format_exc().split('\n'):
+            if line:
+                diagnosis += f"   {line}\n"
+        
+        return diagnosis
     
     async def _handle_empty_action_error(self, step_num: int) -> bool:
         """

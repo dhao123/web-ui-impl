@@ -419,9 +419,18 @@ async def run_agent_task(
     tool_calling_method = tool_calling_str if tool_calling_str != "None" else None
     
     # ✅ 对于 zkh 提供商，强制使用 function_calling 以支持工具调用
-    if llm_provider_name == "zkh" and tool_calling_method == "auto":
-        tool_calling_method = "function_calling"
-        logger.info("🔧 ZKH 提供商已自动设置 Tool Calling Method 为 'function_calling' 以支持工具调用")
+    if llm_provider_name == "zkh":
+        if tool_calling_method != "function_calling":
+            logger.info("🔧 ZKH 提供商已自动设置 Tool Calling Method 为 'function_calling' 以支持工具调用")
+            tool_calling_method = "function_calling"
+        else:
+            logger.info("✅ ZKH 提供商已正确配置为 'function_calling' 模式")
+    
+    # 诊断Tool Calling配置
+    diagnosis_msg = _diagnose_tool_calling_config(
+        llm_provider_name, llm_model_name, tool_calling_method
+    )
+    logger.info(diagnosis_msg)
     
     mcp_server_config_comp = webui_manager.id_to_component.get(
         "agent_settings.mcp_server_config"

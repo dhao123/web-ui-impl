@@ -40,6 +40,7 @@ from typing import (
     Union,
     cast, List,
 )
+from contextlib import contextmanager
 from langchain_anthropic import ChatAnthropic
 from langchain_mistralai import ChatMistralAI
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -118,20 +119,187 @@ class ZKHChatOpenAI(ChatOpenAI):
     """
     震坤行(ZKH) AI API 的自定义ChatOpenAI包装类
     处理ZKH特定的API请求格式和认证
-    完整支持 Tool Calling (Function Calling)
+    完整支持 Tool Calling (Function Calling) 
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         # 使用自定义的OpenAI客户端处理ZKH API
+        api_key = kwargs.get("api_key")
+        base_url = kwargs.get("base_url")
+
+        # 存储ZKH专用值，但不要持久修改进程环境。
+        # 在每次实际发送请求时会临时设置并恢复环境变量。
+        self._zkh_base_url = base_url
+        self._zkh_api_key = api_key
+
+        # 创建 OpenAI 客户端（传入 base_url/api_key 以尽量保证使用指定端点）
         self.client = OpenAI(
-            base_url=kwargs.get("base_url"),
-            api_key=kwargs.get("api_key"),
-            default_headers={
-                "Authorization": f"Bearer {kwargs.get('api_key')}",
-                "Content-Type": "application/json"
-            }
+            base_url=base_url,
+            api_key=api_key
         )
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[ZKHChatOpenAI] 已初始化，BaseURL: {base_url}")
+
+    @contextmanager
+    def _temporary_env(self, overrides: dict):
+        """Temporarily set environment variables from `overrides` and restore after use."""
+        import os
+        saved = {}
+        for k, v in overrides.items():
+            saved[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        try:
+            yield
+        finally:
+            for k, prev in saved.items():
+                if prev is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = prev
+
+    def _build_api_kwargs(self, message_history: list, **kwargs: Any) -> dict:
+        """
+        构建API请求参数，处理tools和消息格式
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # ✅ 基础参数
+        api_kwargs = {
+            "model": self.model_name,
+            "messages": message_history,
+            "temperature": self.temperature,
+        }
+        
+        # ✅ 处理 tools 参数（关键修复！）
+        if "tools" in kwargs and kwargs["tools"]:
+            tools = kwargs["tools"]
+            
+            # ✅ 转换 LangChain 工具为 OpenAI 格式
+            converted_tools = self._convert_tools_to_openai_format(tools)
+            
+            if converted_tools:
+                # 诊断tools参数
+                import json
+                try:
+                    tools_json_str = json.dumps(converted_tools, ensure_ascii=False)
+                    tools_size = len(tools_json_str.encode('utf-8'))
+                    logger.info(f"[ZKHChatOpenAI] Tools参数大小: {tools_size} bytes, 数量: {len(converted_tools)}")
+                except Exception as e:
+                    logger.warning(f"[ZKHChatOpenAI] 无法序列化tools用于诊断: {e}")
+                
+                api_kwargs["tools"] = converted_tools
+                logger.info(f"[ZKHChatOpenAI] 传递 {len(converted_tools)} 个有效的tools参数")
+            else:
+                logger.warning("[ZKHChatOpenAI] Tools列表中没有有效的工具定义，跳过tools参数")
+        
+        # ✅ 检查消息历史的合理性
+        total_chars = sum(len(str(msg.get("content", ""))) for msg in message_history)
+        logger.info(f"[ZKHChatOpenAI] 消息历史总字符数: {total_chars}")
+        
+        return api_kwargs
+    
+    def _convert_tools_to_openai_format(self, tools: list) -> list:
+        """
+        将 LangChain 工具转换为 OpenAI 兼容的格式
+        处理多种工具对象类型
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        if not tools:
+            return []
+        
+        converted_tools = []
+        
+        for tool in tools:
+            try:
+                # 情况1: 已经是OpenAI格式的字典
+                if isinstance(tool, dict):
+                    if 'function' in tool or 'name' in tool:
+                        converted_tools.append(tool)
+                        continue
+                
+                # 情况2: LangChain 工具对象 (StructuredTool, BaseTool等)
+                # 检查是否有 to_dict 或 lc_kwargs 方法
+                if hasattr(tool, 'lc_kwargs'):
+                    # LangChain 工具的标准转换方法
+                    func_dict = self._langchain_tool_to_dict(tool)
+                    if func_dict:
+                        openai_tool = {
+                            "type": "function",
+                            "function": func_dict
+                        }
+                        converted_tools.append(openai_tool)
+                        continue
+                
+                # 情况3: 尝试提取工具的标准属性
+                if hasattr(tool, 'name') and hasattr(tool, 'description'):
+                    func_dict = {
+                        "name": tool.name,
+                        "description": tool.description,
+                    }
+                    
+                    # 添加参数信息（如果有）
+                    if hasattr(tool, 'args'):
+                        func_dict["parameters"] = tool.args
+                    elif hasattr(tool, 'args_schema'):
+                        func_dict["parameters"] = self._extract_schema(tool.args_schema)
+                    
+                    openai_tool = {
+                        "type": "function",
+                        "function": func_dict
+                    }
+                    converted_tools.append(openai_tool)
+                    continue
+                
+                logger.warning(f"[ZKHChatOpenAI] 无法转换工具: {type(tool).__name__}")
+                
+            except Exception as e:
+                logger.warning(f"[ZKHChatOpenAI] 转换工具失败 ({type(tool).__name__}): {e}")
+        
+        return converted_tools
+    
+    def _langchain_tool_to_dict(self, tool) -> dict:
+        """
+        将 LangChain 工具转换为字典格式
+        """
+        try:
+            func_dict = {
+                "name": tool.name if hasattr(tool, 'name') else str(tool)[:20],
+                "description": tool.description if hasattr(tool, 'description') else "",
+            }
+            
+            # 提取参数schema
+            if hasattr(tool, 'args_schema') and tool.args_schema:
+                func_dict["parameters"] = self._extract_schema(tool.args_schema)
+            
+            return func_dict
+        except Exception as e:
+            return None
+    
+    def _extract_schema(self, schema) -> dict:
+        """
+        从 Pydantic schema 或其他格式提取参数定义
+        """
+        try:
+            # 如果是 Pydantic schema
+            if hasattr(schema, 'model_json_schema'):
+                return schema.model_json_schema()
+            elif hasattr(schema, 'schema'):
+                return schema.schema()
+            elif isinstance(schema, dict):
+                return schema
+            else:
+                return {"type": "object", "properties": {}}
+        except Exception as e:
+            return {"type": "object", "properties": {}}
 
     async def ainvoke(
             self,
@@ -142,6 +310,10 @@ class ZKHChatOpenAI(ChatOpenAI):
             **kwargs: Any,
     ) -> AIMessage:
         import traceback
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # 构建消息历史
         message_history = []
         for input_ in input:
             if isinstance(input_, SystemMessage):
@@ -156,25 +328,40 @@ class ZKHChatOpenAI(ChatOpenAI):
                 message_history.append({"role": "user", "content": input_.content})
 
         # ✅ 构建 API 调用参数
-        api_kwargs = {
-            "model": self.model_name,
-            "messages": message_history,
-            "temperature": self.temperature,
-        }
-        # ✅ 从 kwargs 中提取并传递 tools 参数（关键修复！）
-        if "tools" in kwargs and kwargs["tools"]:
-            api_kwargs["tools"] = kwargs["tools"]
-
-        # 日志输出请求参数
-        print("\n[ZKHChatOpenAI] 请求参数:", api_kwargs)
+        api_kwargs = self._build_api_kwargs(message_history, **kwargs)
+        
+        # 日志输出请求参数（不显示完整的消息体，因为可能太长）
+        logger.info(f"[ZKHChatOpenAI] 准备发送API请求:")
+        logger.info(f"  - 模型: {api_kwargs.get('model')}")
+        logger.info(f"  - 消息数: {len(api_kwargs.get('messages', []))}")
+        logger.info(f"  - Tools: {len(api_kwargs.get('tools', []))} 个")
+        logger.info(f"  - 温度: {api_kwargs.get('temperature')}")
+        
         try:
-            response = self.client.chat.completions.create(**api_kwargs)
+            # 在调用时临时设置环境变量，避免影响同一进程中其他provider
+            env_overrides = {}
+            if getattr(self, '_zkh_base_url', None):
+                env_overrides['OPENAI_API_BASE'] = self._zkh_base_url
+            if getattr(self, '_zkh_api_key', None):
+                env_overrides['OPENAI_API_KEY'] = self._zkh_api_key
+
+            if env_overrides:
+                with self._temporary_env(env_overrides):
+                    response = self.client.chat.completions.create(**api_kwargs)
+            else:
+                response = self.client.chat.completions.create(**api_kwargs)
+
+            logger.info("[ZKHChatOpenAI] API请求成功")
         except Exception as e:
-            print("[ZKHChatOpenAI] LLM请求异常:", str(e))
-            print("[ZKHChatOpenAI] Traceback:\n", traceback.format_exc())
+            error_msg = str(e)
+            logger.error(f"[ZKHChatOpenAI] LLM请求异常: {error_msg}")
+            logger.error(f"[ZKHChatOpenAI] 请求参数总结:")
+            logger.error(f"  - 模型: {api_kwargs.get('model')}")
+            logger.error(f"  - 消息数: {len(api_kwargs.get('messages', []))}")
+            logger.error(f"  - Tools数: {len(api_kwargs.get('tools', []))}")
+            logger.debug(f"[ZKHChatOpenAI] Traceback:\n{traceback.format_exc()}")
             raise
 
-        print("[ZKHChatOpenAI] 响应:", response)
         content = response.choices[0].message.content
         # ✅ 提取 tool_calls
         tool_calls = getattr(response.choices[0].message, "tool_calls", None)
@@ -182,6 +369,8 @@ class ZKHChatOpenAI(ChatOpenAI):
         ai_message = AIMessage(content=content)
         if tool_calls:
             ai_message.tool_calls = tool_calls
+        
+        logger.info(f"[ZKHChatOpenAI] 返回内容长度: {len(content) if content else 0}")
         return ai_message
 
     def invoke(
@@ -192,6 +381,11 @@ class ZKHChatOpenAI(ChatOpenAI):
             stop: Optional[list[str]] = None,
             **kwargs: Any,
     ) -> AIMessage:
+        import logging
+        import traceback
+        logger = logging.getLogger(__name__)
+        
+        # 构建消息历史
         message_history = []
         for input_ in input:
             if isinstance(input_, SystemMessage):
@@ -206,17 +400,32 @@ class ZKHChatOpenAI(ChatOpenAI):
                 message_history.append({"role": "user", "content": input_.content})
 
         # ✅ 构建 API 调用参数
-        api_kwargs = {
-            "model": self.model_name,
-            "messages": message_history,
-            "temperature": self.temperature,
-        }
+        api_kwargs = self._build_api_kwargs(message_history, **kwargs)
         
-        # ✅ 从 kwargs 中提取并传递 tools 参数（关键修复！）
-        if "tools" in kwargs and kwargs["tools"]:
-            api_kwargs["tools"] = kwargs["tools"]
+        logger.info(f"[ZKHChatOpenAI] 准备发送API请求 (同步):")
+        logger.info(f"  - 模型: {api_kwargs.get('model')}")
+        logger.info(f"  - 消息数: {len(api_kwargs.get('messages', []))}")
+        logger.info(f"  - Tools: {len(api_kwargs.get('tools', []))} 个")
         
-        response = self.client.chat.completions.create(**api_kwargs)
+        try:
+            env_overrides = {}
+            if getattr(self, '_zkh_base_url', None):
+                env_overrides['OPENAI_API_BASE'] = self._zkh_base_url
+            if getattr(self, '_zkh_api_key', None):
+                env_overrides['OPENAI_API_KEY'] = self._zkh_api_key
+
+            if env_overrides:
+                with self._temporary_env(env_overrides):
+                    response = self.client.chat.completions.create(**api_kwargs)
+            else:
+                response = self.client.chat.completions.create(**api_kwargs)
+
+            logger.info("[ZKHChatOpenAI] API请求成功 (同步)")
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"[ZKHChatOpenAI] LLM请求异常 (同步): {error_msg}")
+            logger.debug(f"[ZKHChatOpenAI] Traceback:\n{traceback.format_exc()}")
+            raise
 
         content = response.choices[0].message.content
         # ✅ 提取 tool_calls
@@ -225,10 +434,8 @@ class ZKHChatOpenAI(ChatOpenAI):
         ai_message = AIMessage(content=content)
         if tool_calls:
             ai_message.tool_calls = tool_calls
+        
         return ai_message
-
-        content = response.choices[0].message.content
-        return AIMessage(content=content)
 
 
 class DeepSeekR1ChatOllama(ChatOllama):
